@@ -259,7 +259,11 @@ export default function App() {
   const [intelSource,    setIntelSource]    = useState(null); // 'CLOUD_AI' | 'LOCAL_AI' | null
   const [isSynthesizing, setIsSynthesizing] = useState(false);
 
-  /* ── Crypto state ── */
+  /* ── Family Trace state ── */
+  const [familyInputs,  setFamilyInputs]  = useState([""]);
+  const [familyMatches, setFamilyMatches] = useState({});   // hash -> { node, ts }
+  const [tracing,       setTracing]       = useState(false);
+  const familyWatchlistRef = useRef(new Map()); // hash -> original input string
   const [cryptoKeys,      setCryptoKeys]      = useState(null);
   const [securityStatus,  setSecurityStatus]  = useState("GENERATING"); // GENERATING | SECURED | UNSECURED
 
@@ -427,23 +431,33 @@ Respond ONLY with a JSON object, no markdown:
             {
               role: "system",
               content: `You are GhostNet's crisis AI. Analyze mesh survival reports and produce a tactical intelligence brief.
-Format exactly like this, plain text only, no markdown:
+CRITICAL FORMATTING RULE: You MUST output a blank line after every section header before writing content. Plain text only, absolutely no markdown.
+
+Format EXACTLY like this — blank lines are mandatory:
+
 ─────────────────────────────
-GHOSTNET INTEL BRIEF [TIME]
+GHOSTNET INTEL BRIEF ${nowZ()}
 ◈ CLOUD AI — FULL ANALYSIS
 ─────────────────────────────
+
 [THREAT ASSESSMENT]
-One line max.
+
+Your threat assessment text here. One line max.
 
 [RESOURCES]
-One line max.
+
+Your resources text here. One line max.
 
 [RECOMMENDATION]
+
 One specific actionable recommendation.
 
 [ANOMALIES]
-Any contradicting reports or NONE DETECTED.
+
+NONE DETECTED or describe anomaly.
+
 ─────────────────────────────
+
 Under 120 words total. Be direct. Lives depend on this.`,
             },
             {
@@ -555,6 +569,53 @@ Under 120 words total. Be direct. Lives depend on this.`,
   }, []);
 
   /* ═══════════════════════════════════════════════════════════════
+     FAMILY TRACE — privacy-preserving phone number search
+     ═══════════════════════════════════════════════════════════════ */
+  const hashPhone = useCallback(async (phone) => {
+    const cleaned = phone.replace(/\D/g, "");
+    if (!cleaned) return null;
+    const buffer = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(cleaned)
+    );
+    return Array.from(new Uint8Array(buffer))
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 16);
+  }, []);
+
+  const handleFamilyTrace = useCallback(async () => {
+    const validInputs = familyInputs.filter(s => s.trim().length > 4);
+    if (!validInputs.length) return;
+    setTracing(true);
+
+    // Build watchlist: hash -> display string
+    const newWatchlist = new Map();
+    for (const phone of validInputs) {
+      const h = await hashPhone(phone.trim());
+      if (h) newWatchlist.set(h, phone.trim());
+    }
+    familyWatchlistRef.current = newWatchlist;
+
+    // Scan current mesh
+    const matches = {};
+    for (const node of Object.values(networkNodes)) {
+      if (!node || !node.familyHashes) continue;
+      for (const h of node.familyHashes) {
+        if (newWatchlist.has(h)) {
+          matches[h] = {
+            node,
+            input:    newWatchlist.get(h),
+            ts:       node.timestamp,
+          };
+        }
+      }
+    }
+    setFamilyMatches(matches);
+    setTracing(false);
+  }, [familyInputs, networkNodes, hashPhone]);
+
+  /* ═══════════════════════════════════════════════════════════════
      YJS + GEOLOCATION BOOTSTRAP
      ═══════════════════════════════════════════════════════════════ */
   useEffect(() => {
@@ -633,7 +694,25 @@ Under 120 words total. Be direct. Lives depend on this.`,
       }
     });
 
-    /* Observe shared map — verify signatures + auto-synthesize on new messages */
+    /* Observe shared map — verify signatures with retry + auto-synthesize on new messages */
+    const verifyWithRetry = async (value, key, allNodes) => {
+      if (!value.signature || !value.publicKey) {
+        allNodes[key] = { ...value, verified: false, verifyStatus: "NO_KEY" };
+        return;
+      }
+      const packetBuffer = SurvivalPacket.encode(
+        value.id || key, value.lat ?? 0, value.lng ?? 0, "ACTIVE", value.type ?? "safe", []
+      );
+      let valid = await verifyPacket(packetBuffer, value.signature, value.publicKey);
+      if (!valid) {
+        // Public key may not have propagated yet — retry once after 2 s
+        await new Promise(r => setTimeout(r, 2000));
+        valid = await verifyPacket(packetBuffer, value.signature, value.publicKey);
+      }
+      allNodes[key] = { ...value, verified: valid, verifyStatus: valid ? "VERIFIED" : "FAILED" };
+      if (!valid) console.warn(`⚠ GHOSTNET: Rejected unverified packet from ${value.id}`);
+    };
+
     const onMapChange = () => {
       const allNodes  = {};
       const promises  = [];
@@ -642,31 +721,36 @@ Under 120 words total. Be direct. Lives depend on this.`,
         if (!value) return;
 
         if (value.id === nodeId) {
-          // Own node — always trusted
-          allNodes[key] = { ...value, verified: true };
+          allNodes[key] = { ...value, verified: true, verifyStatus: "SELF" };
           return;
         }
 
-        if (value.signature && value.publicKey) {
-          // Reconstruct the exact buffer that was signed
-          const buf = SurvivalPacket.encode(
-            value.id, value.lat ?? 0, value.lng ?? 0, "ACTIVE", value.type ?? "safe", []
-          );
-          promises.push(
-            verifyPacket(buf, value.signature, value.publicKey).then(valid => {
-              allNodes[key] = { ...value, verified: valid };
-              if (!valid) console.warn(`⚠ GHOSTNET: Rejected unverified packet from ${value.id}`);
-            })
-          );
-        } else {
-          // No signature yet (key still generating or legacy node)
-          allNodes[key] = { ...value, verified: false };
-        }
+        promises.push(verifyWithRetry(value, key, allNodes));
       });
 
       Promise.all(promises).then(() => {
         const snapshot = { ...allNodes };
         setNetworkNodes(snapshot);
+
+        // Family trace: check incoming nodes' hashes against watchlist
+        if (familyWatchlistRef.current.size > 0) {
+          const newMatches = {};
+          for (const node of Object.values(snapshot)) {
+            if (!node || !node.familyHashes) continue;
+            for (const h of node.familyHashes) {
+              if (familyWatchlistRef.current.has(h)) {
+                newMatches[h] = {
+                  node,
+                  input: familyWatchlistRef.current.get(h),
+                  ts:    node.timestamp,
+                };
+              }
+            }
+          }
+          if (Object.keys(newMatches).length > 0) {
+            setFamilyMatches(prev => ({ ...prev, ...newMatches }));
+          }
+        }
 
         const msgCount = Object.values(snapshot).filter(n => n && n.message).length;
         if (msgCount > prevMsgCount.current) {
@@ -785,14 +869,15 @@ Under 120 words total. Be direct. Lives depend on this.`,
     const signature = await signPacket(buffer);
 
     // Base node update payload (shared between blackout/online paths)
+    const selfHashes = Array.from(familyWatchlistRef.current.keys());
     const nodeUpdate = {
       ...current,
-      message:   text,
-      type:      quickType,
-      needs:     quickNeeds,
-      timestamp: Date.now(),
-      signature: signature || null,
-      // publicKey already stored on first registration; preserve it
+      message:      text,
+      type:         quickType,
+      needs:        quickNeeds,
+      timestamp:    Date.now(),
+      signature:    signature || null,
+      familyHashes: selfHashes.length ? selfHashes : (current.familyHashes || []),
     };
 
     if (blackout) {
@@ -917,6 +1002,28 @@ Under 120 words total. Be direct. Lives depend on this.`,
           }}>
             {syncStatus === "SYNCED" ? "● SYNCED" : "◌ SYNCING"}
           </span>
+
+          {/* AID VIEW link */}
+          <a
+            href="/dashboard"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              color:          "#00D4FF",
+              fontFamily:     "'Space Mono',monospace",
+              fontSize:       10,
+              letterSpacing:  "0.08em",
+              border:         "1px solid rgba(0,212,255,0.5)",
+              padding:        "3px 8px",
+              textDecoration: "none",
+              borderRadius:   2,
+              transition:     "all 0.15s",
+            }}
+            onMouseEnter={e => e.target.style.background = "rgba(0,212,255,0.08)"}
+            onMouseLeave={e => e.target.style.background = "transparent"}
+          >
+            ◈ AID VIEW
+          </a>
 
           <button
             className={`blackout-toggle font-space${blackout ? " active" : ""}`}
@@ -1074,6 +1181,136 @@ Under 120 words total. Be direct. Lives depend on this.`,
                 })
               )}
             </div>
+          </div>
+
+          <div className="divider" />
+
+          {/* ── FAMILY TRACE ── */}
+          <div className="panel-section" style={{ paddingBottom: 14 }}>
+            <span className="section-label">◈ Family Trace</span>
+            <div style={{
+              fontFamily: "'Space Mono',monospace",
+              fontSize: 8,
+              letterSpacing: "0.08em",
+              color: "var(--muted)",
+              marginBottom: 8,
+              lineHeight: 1.6,
+            }}>
+              Enter phone numbers to locate family in mesh. Hashed locally — no raw numbers transmitted.
+            </div>
+
+            {/* Input list */}
+            {familyInputs.map((val, i) => (
+              <div key={i} style={{ display: "flex", gap: 4, marginBottom: 4 }}>
+                <input
+                  type="text"
+                  value={val}
+                  onChange={e => {
+                    const next = [...familyInputs];
+                    next[i] = e.target.value;
+                    setFamilyInputs(next);
+                  }}
+                  placeholder="+91 98765 43210"
+                  style={{
+                    flex:        1,
+                    background:  "rgba(255,255,255,0.03)",
+                    border:      "1px solid var(--border)",
+                    color:       "var(--text)",
+                    fontFamily:  "'JetBrains Mono',monospace",
+                    fontSize:    10,
+                    padding:     "5px 8px",
+                    borderRadius: 2,
+                    outline:     "none",
+                  }}
+                  onFocus={e => e.target.style.borderColor = "rgba(0,212,255,0.4)"}
+                  onBlur={e  => e.target.style.borderColor = "var(--border)"}
+                />
+                {familyInputs.length > 1 && (
+                  <button
+                    onClick={() => setFamilyInputs(prev => prev.filter((_, j) => j !== i))}
+                    style={{
+                      background: "transparent", border: "1px solid var(--border)",
+                      color: "var(--muted)", fontFamily: "'Space Mono',monospace",
+                      fontSize: 9, padding: "0 6px", cursor: "pointer", borderRadius: 2,
+                    }}
+                  >✕</button>
+                )}
+              </div>
+            ))}
+
+            {/* Add + Trace buttons */}
+            <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+              <button
+                onClick={() => setFamilyInputs(prev => [...prev, ""])}
+                style={{
+                  flex: 1, background: "transparent",
+                  border: "1px solid var(--border)", color: "var(--muted)",
+                  fontFamily: "'Space Mono',monospace", fontSize: 9,
+                  padding: "5px 0", cursor: "pointer", borderRadius: 2,
+                  letterSpacing: "0.06em",
+                }}
+              >
+                + ADD
+              </button>
+              <button
+                onClick={handleFamilyTrace}
+                disabled={tracing}
+                style={{
+                  flex: 2, background: "transparent",
+                  border: `1px solid ${tracing ? "var(--muted)" : "rgba(0,212,255,0.5)"}`,
+                  color: tracing ? "var(--muted)" : "var(--cyan)",
+                  fontFamily: "'Space Mono',monospace", fontSize: 9, fontWeight: 700,
+                  padding: "5px 0", cursor: tracing ? "not-allowed" : "pointer",
+                  borderRadius: 2, letterSpacing: "0.08em",
+                }}
+              >
+                {tracing ? "[ TRACING... ]" : "[ TRACE ]"}
+              </button>
+            </div>
+
+            {/* Results */}
+            {familyInputs.some(v => v.trim().length > 4) && (
+              <div style={{ marginTop: 10 }}>
+                {familyInputs.filter(v => v.trim().length > 4).map((phone, i) => {
+                  // Find match for this phone (look up by iterating matches)
+                  const matchEntry = Object.values(familyMatches).find(m => m.input === phone.trim());
+                  return (
+                    <div key={i} style={{
+                      marginBottom: 8,
+                      padding: "7px 8px",
+                      background: matchEntry ? "rgba(0,255,148,0.04)" : "rgba(74,74,106,0.06)",
+                      border: `1px solid ${matchEntry ? "rgba(0,255,148,0.15)" : "rgba(74,74,106,0.2)"}`,
+                      borderRadius: 2,
+                    }}>
+                      <div style={{
+                        fontFamily: "'Space Mono',monospace", fontSize: 9,
+                        letterSpacing: "0.06em",
+                        color: matchEntry ? "var(--green)" : "var(--muted)",
+                        marginBottom: matchEntry ? 4 : 0,
+                      }}>
+                        ◈ {phone.trim()}
+                      </div>
+                      {matchEntry ? (
+                        <>
+                          <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "var(--green)" }}>
+                            ● LAST SEEN: NODE {matchEntry.node.id} — {new Date(matchEntry.ts).toISOString().slice(11, 16)}Z
+                          </div>
+                          <div style={{ fontFamily: "'Space Mono',monospace", fontSize: 8, color: "var(--muted)", marginTop: 2 }}>
+                            {matchEntry.node.locationReal
+                              ? `GPS CONFIRMED ±${matchEntry.node.accuracy}m`
+                              : "GPS ESTIMATED"}
+                          </div>
+                        </>
+                      ) : (
+                        <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "var(--muted)" }}>
+                          ○ NOT YET DETECTED IN MESH
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
         </aside>
